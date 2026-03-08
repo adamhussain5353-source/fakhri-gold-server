@@ -3,7 +3,6 @@ import cors from "cors";
 import multer from "multer";
 import cloudinary from "cloudinary";
 import admin from "firebase-admin";
-import fs from "fs";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -13,9 +12,7 @@ app.use(cors());
 app.use(express.json());
 
 /* ================= FIREBASE ================= */
-const mainServiceAccount = JSON.parse(
-  fs.readFileSync("./MainServiceKey.json", "utf8")
-);
+const mainServiceAccount = JSON.parse(process.env.MAIN_SERVICE_KEY);
 
 const mainAdminApp = admin.initializeApp(
   {
@@ -28,9 +25,7 @@ const mainAdminApp = admin.initializeApp(
 const mainDB = mainAdminApp.database();
 /* ================= HISTORY FIREBASE ================= */
 
-const serviceAccount = JSON.parse(
-  fs.readFileSync("./serviceAccountKey.json", "utf8")
-);
+const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_KEY);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -41,9 +36,7 @@ const historyDB = admin.database();
 
 /* ================= TRANSLATION FIREBASE ================= */
 
-const translationServiceAccount = JSON.parse(
-  fs.readFileSync("./translationServiceKey.json", "utf8")
-);
+const translationServiceAccount = JSON.parse(process.env.TRANSLATION_SERVICE_KEY);
 
 const translationAdminApp = admin.initializeApp(
   {
@@ -58,9 +51,7 @@ const translationDB = translationAdminApp.database();
 
 /* ================= ADMIN-DATA FIREBASE ================= */
 
-const adminDataServiceAccount = JSON.parse(
-  fs.readFileSync("./adminServiceKey.json", "utf8")
-);
+const adminDataServiceAccount = JSON.parse(process.env.ADMIN_SERVICE_KEY);
 
 const adminDataApp = admin.initializeApp(
   {
