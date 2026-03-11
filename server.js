@@ -86,6 +86,10 @@ function extractPublicId(url) {
   return match ? match[1] : null;
 }
 
+app.get("/ping", (req, res) => {
+  res.send("alive");
+});
+
 /* ================= CHECK ADMIN ================= */
 
 app.post("/api/check-admin", async (req, res) => {
