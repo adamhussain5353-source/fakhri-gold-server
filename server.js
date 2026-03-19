@@ -63,6 +63,20 @@ const adminDataApp = admin.initializeApp(
 
 const adminDB = adminDataApp.database();
 
+/* ================= ADMIN-DATA FIREBASE ================= */
+
+const userServiceAccount = JSON.parse(process.env.USER_SERVICE_KEY);
+
+const userApp = admin.initializeApp(
+  {
+    credential: admin.credential.cert(userServiceAccount),
+    databaseURL: "https://user-pref-84fa6-default-rtdb.asia-southeast1.firebasedatabase.app"
+  },
+  "userApp"
+);
+
+const userDB = userApp.database();
+
 /* ================= CLOUDINARY ================= */
 cloudinary.v2.config({
   cloud_name: process.env.CLOUD_NAME,
@@ -86,8 +100,8 @@ function extractPublicId(url) {
   return match ? match[1] : null;
 }
 
-app.get("/ping", (req, res) => {
-  res.send("alive");
+app.get("/", (req, res) => {
+  res.send("Server is running");
 });
 
 /* ================= CHECK ADMIN ================= */
@@ -287,6 +301,7 @@ app.post("/api/upload-image", upload.single("image"), async (req, res) => {
 /* ================= UPDATE MONTH DATA ================= */
 app.post("/api/update-month", async (req, res) => {
   try {
+
     const { item } = req.body;
 
     if (!item || !Array.isArray(item)) {
@@ -295,35 +310,53 @@ app.post("/api/update-month", async (req, res) => {
 
     const monthRef = adminDB.ref("monthData");
 
-    item.forEach((product) => {
+    for (const product of item) {
 
       const { id, purity, category, quantity } = product;
 
       const qty = Number(quantity) || 0;
 
-      if (qty <= 0) return;
+      if (qty <= 0) continue;
 
-      const keysToUpdate = [];
+      // ---------- PRODUCTS ----------
+      if (id) {
+        const productRef = monthRef.child(`products/${id}`);
 
-      if (id) keysToUpdate.push(id);
-      if (purity) keysToUpdate.push(purity);
-      if (category) keysToUpdate.push(category);
-
-      for (const key of keysToUpdate) {
-
-        monthRef.child(key).transaction((currentValue) => {
-          return (currentValue || 0) + qty;
+        await productRef.transaction((current) => {
+          return (current || 0) + qty;
         });
-
       }
 
-    });
+      // ---------- PURITY ----------
+      if (purity) {
+        const purityRef = monthRef.child(`purity/${purity}`);
+
+        await purityRef.transaction((current) => {
+          return (current || 0) + qty;
+        });
+      }
+
+      // ---------- CATEGORY ----------
+      if (category) {
+        const categoryRef = monthRef.child(`category/${category}`);
+
+        await categoryRef.transaction((current) => {
+          return (current || 0) + qty;
+        });
+      }
+
+    }
 
     res.json({ success: true });
 
   } catch (err) {
+
     console.error("SAVE ERROR:", err);
-    res.status(500).json({ error: "Failed to update month data" });
+
+    res.status(500).json({
+      error: "Failed to update month data"
+    });
+
   }
 });
 
@@ -372,78 +405,53 @@ app.get("/api/product-dates/:productId", async (req, res) => {
 app.get("/api/get-month-analysis", async (req, res) => {
   try {
 
-    const monthRef = adminDB.ref("monthData");
-    const snapshot = await monthRef.once("value");
+    const snap = await adminDB.ref("monthData").get();
 
-    if (!snapshot.exists()) {
+    if (!snap.exists()) {
       return res.json({
         success: true,
-        topPurity: null,
-        topCategory: null,
-        topId: null
+        bestPurity: null,
+        bestCategory: null,
+        topProducts: []
       });
     }
 
-    const data = snapshot.val();
-    const items = Object.keys(data);
+    const data = snap.val();
 
-    const purity = [];
-    const category = [];
-    const id = [];
+    const products = data.products || {};
+    const purity = data.purity || {};
+    const category = data.category || {};
 
-    const purityList = ["24k", "22k", "21k", "18k"];
-    const categoryList = ["bangle", "bracelet", "necklace", "ring", "earring", "other"];
+    // ===== BEST PRODUCTS =====
+    const bestProduct = Object.entries(products)
+      .sort((a,b) => b[1] - a[1])[0]?.[0] || null;
 
-    // Separate values
-    items.forEach((item) => {
-
-      const value = Number(data[item]) || 0;
-
-      if (purityList.includes(item)) {
-        purity.push({ key: item, value });
-      }
-      else if (categoryList.includes(item)) {
-        category.push({ key: item, value });
-      }
-      else {
-        id.push({ key: item, value });
-      }
-
-    });
-
-    // ===== REDUCE TO FIND MAX =====
-
-    const topPurity = purity.length > 0
-      ? purity.reduce((max, current) =>
-          current.value > max.value ? current : max
-        )
+    // ===== BEST PURITY =====
+    const bestPurity = Object.entries(purity).length
+      ? Object.entries(purity).sort((a,b)=>b[1]-a[1])[0][0]
       : null;
 
-    const topCategory = category.length > 0
-      ? category.reduce((max, current) =>
-          current.value > max.value ? current : max
-        )
-      : null;
-
-    const topId = id.length > 0
-      ? id.reduce((max, current) =>
-          current.value > max.value ? current : max
-        )
+    // ===== BEST CATEGORY =====
+    const bestCategory = Object.entries(category).length
+      ? Object.entries(category).sort((a,b)=>b[1]-a[1])[0][0]
       : null;
 
     res.json({
       success: true,
-      topPurity,
-      topCategory,
-      topId,
+      bestPurity,
+      bestCategory,
+      bestProduct
     });
 
   } catch (err) {
+
     console.error("MONTH ANALYSIS ERROR:", err);
+
     res.status(500).json({
       success: false,
       error: "Failed to analyze month data"
     });
+
   }
 });
 
@@ -504,6 +512,29 @@ app.post("/api/get-history", async (req, res) => {
   } catch (err) {
     console.error("GET HISTORY ERROR:", err);
     res.status(500).json({ error: "Failed to fetch history" });
+  }
+});
+
+/* ================= SET ARRIVAL ================= */
+app.post("/api/mark-complete", async (req, res) => {
+  try {
+    const { userEmail, orderId, itemIndex, status } = req.body;
+
+    if (!userEmail || !orderId || itemIndex === undefined) {
+      return res.status(400).json({ error: "Missing data" });
+    }
+
+    const historyRef = historyDB.ref(`history/${userEmail}/${orderId}/itemList/${itemIndex}`);
+
+    await historyRef.update({
+      complete: Boolean(status)
+    });
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error("SAVE ERROR:", err);
+    res.status(500).json({ error: "Failed to save" });
   }
 });
 
@@ -939,7 +970,6 @@ app.post("/api/update-profile-data", async (req, res) => {
 
 app.get("/api/get-market-hype", async (req, res) => {
   try {
-
     const monthRef = adminDB.ref("monthData");
     const snapshot = await monthRef.once("value");
 
@@ -956,8 +986,13 @@ app.get("/api/get-market-hype", async (req, res) => {
 
     let totalQty = 0;
 
-    Object.values(data).forEach(value => {
-      totalQty += Number(value) || 0;
+    Object.values(data).forEach(section => {
+      if (typeof section === "object") {
+        Object.values(section).forEach(value => {
+          totalQty += Number(value) || 0;
+        });
+      }
+
     });
 
     let hypeScore = Math.min((totalQty / 300) * 100, 100);
@@ -977,7 +1012,7 @@ app.get("/api/get-market-hype", async (req, res) => {
       success: true,
       totalQty,
       hypeScore,
-      hypeLevel
+      hypeLevel,
     });
 
   } catch (error) {
@@ -1052,8 +1087,126 @@ app.post("/api/get-profile-dashboard", async (req, res) => {
   }
 });
 
+app.post("/api/add-pref", async (req, res) => {
+  try {
+    const { email, id, purity, category, points } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ success: false });
+    }
+
+    const safeEmail = email.split("@")[0];
+
+    const userRef = userDB.ref(`user_pref/${safeEmail}`);
+
+    const score = points || 1; // default 1
+
+    const updates = {};
+
+    if (id) updates[`id/${id}`] = admin.database.ServerValue.increment(score);
+    if (purity) updates[`purity/${purity}`] = admin.database.ServerValue.increment(score);
+    if (category) updates[`category/${category}`] = admin.database.ServerValue.increment(score);
+
+    await userRef.update(updates);
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error("Preference error:", err);
+    res.status(500).json({ success: false });
+  }
+});
+
+/* ================= GET USER PREF ================= */
+
+app.get("/api/user-pref/:email", async (req, res) => {
+  try {
+
+    let { email } = req.params;
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        error: "Email required"
+      });
+    }
+
+    // convert email to firebase-safe key
+    const safeEmail = email.split("@")[0];
+
+    const prefRef = userDB.ref(`user_pref/${safeEmail}`);
+
+    const snap = await prefRef.get();
+
+    if (!snap.exists()) {
+      return res.json({
+        success: true,
+        data: null
+      });
+    }
+
+    res.json({
+      success: true,
+      data: snap.val()
+    });
+
+  } catch (error) {
+
+    console.error("User pref error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Failed to get user preferences"
+    });
+
+  }
+});
+
+/* ================= TOP TRENDING PRODUCTS ================= */
+
+app.get("/api/top-products", async (req, res) => {
+
+  try {
+
+    const ref = adminDB.ref("monthData/products");
+
+    const snap = await ref.get();
+
+    if (!snap.exists()) {
+      return res.json({
+        success: true,
+        topProducts: []
+      });
+    }
+
+    const data = snap.val();
+
+    const topProducts = Object.entries(data)
+      .sort((a, b) => b[1] - a[1]) // sort by clicks
+      .slice(0, 5)                 // top 5
+      .map(x => x[0]);             // return only ids
+
+    res.json({
+      success: true,
+      topProducts
+    });
+
+  } catch (error) {
+
+    console.error("Top products error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: "Failed to get top products"
+    });
+
+  }
+
+});
+
 /* ================= SERVER ================= */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`🚀 Server running on http://localhost:${PORT}`)
-);
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
