@@ -5,34 +5,6 @@ import cloudinary from "cloudinary";
 import admin from "firebase-admin";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
-import { pipeline } from "@xenova/transformers";
-
-let extractor;
-
-async function loadModel() {
-  if (!extractor) {
-    console.log("Loading AI model...");
-    extractor = await pipeline(
-      "image-feature-extraction",
-      "Xenova/clip-vit-base-patch32",
-    );
-    console.log("Model loaded");
-  }
-}
-
-let textModel;
-
-async function loadTextModel() {
-  if (!textModel) {
-    console.log("Loading text model...");
-    textModel = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
-    console.log("Text model loaded ✅");
-  }
-}
-
-loadTextModel();
-
-loadModel();
 
 dotenv.config();
 
@@ -132,32 +104,6 @@ function extractPublicId(url) {
 app.get("/", (req, res) => {
   res.send("Server is running");
 });
-
-async function getImageVector(imageUrl) {
-  await loadModel();
-
-  const result = await extractor(imageUrl, {
-    pooling: "mean",
-    normalize: true,
-  });
-
-  return Array.from(Float32Array.from(result.data)).map((v) =>
-    Number(v.toFixed(4)),
-  );
-}
-
-async function getEmbedding(text) {
-  await loadTextModel();
-
-  const output = await textModel(text, {
-    pooling: "mean",
-    normalize: true,
-  });
-
-  return Array.from(Float32Array.from(output.data)).map((v) =>
-    Number(v.toFixed(4)),
-  );
-}
 
 function cosineSimilarity(a, b) {
   let dot = 0,
@@ -307,148 +253,6 @@ app.get("/api/semantic-search/:query", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false });
-  }
-});
-
-/* ================= VECTOR BACK-FILLER ================= */
-
-app.get("/api/backfill-vectors", async (req, res) => {
-  try {
-    const productsRef = mainDB.ref("products");
-    const snapshot = await productsRef.once("value");
-
-    const products = snapshot.val();
-    if (!products) return res.json({ success: false });
-
-    const updates = {};
-    let count = 0;
-
-    for (const key in products) {
-      const product = products[key];
-
-      // skip if already has vector
-      if (product.vector && product.vector.length) continue;
-      if (product.textVector && product.textVector.length) continue;
-
-      if (!product.mainImage) continue;
-      if (!product.name || !product.category || !product.description) continue;
-
-      console.log("Processing:", product.name);
-
-      try {
-        const textForVector = `
-          ${product.name} 
-          ${product.category} 
-          ${product.description}
-        `;
-
-        const textVector = await getEmbedding(textForVector);
-        const vector = await getImageVector(product.mainImage);
-
-        updates[`${key}/vector`] = vector;
-        updates[`${key}/textVector`] = textVector;
-        count++;
-      } catch (err) {
-        console.log("Failed for:", product.name);
-      }
-    }
-
-    await productsRef.update(updates);
-
-    res.json({
-      success: true,
-      updated: count,
-    });
-  } catch (err) {
-    console.error("Backfill error:", err);
-    res.status(500).json({ error: "Failed" });
-  }
-});
-
-/* ================= DELETE VECTOR ================= */
-
-app.get("/api/delete-vectors", async (req, res) => {
-  try {
-    const productsRef = mainDB.ref("products");
-    const snapshot = await productsRef.once("value");
-
-    const products = snapshot.val();
-    if (!products) return res.json({ success: false });
-
-    const updates = {};
-    let count = 0;
-
-    for (const key in products) {
-      const product = products[key];
-
-      if (product.vector) {
-        console.log("Removing vector from:", product.name);
-
-        updates[`${key}/vector`] = null;
-        count++;
-      }
-    }
-
-    await productsRef.update(updates);
-
-    res.json({
-      success: true,
-      removed: count,
-    });
-  } catch (err) {
-    console.error("Delete vectors error:", err);
-    res.status(500).json({ error: "Failed" });
-  }
-});
-
-app.post("/create-payment", async (req, res) => {
-  try {
-    const { amount, name, email, mobile } = req.body;
-
-    const mfRes = await fetch("https://apitest.myfatoorah.com/v3/payments", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer SK_KWT_vVZlnnAqu8jRByOWaRPNId4ShzEDNt256dvnjebuyzo52dXjAfRx2ixW5umjWSUx",
-      },
-      body: JSON.stringify({
-        PaymentMethod: "KNET",
-
-        Order: {
-          Amount: amount,
-          Currency: "KWD",
-          Reference: "FG-" + Date.now(),
-        },
-
-        Customer: {
-          Name: name,
-          Email: email,
-          Mobile: {
-            CountryCode: "+965",
-            Number: mobile
-          },
-        },
-
-        NotificationOption: "LINK",
-
-        IntegrationUrls: {
-          SuccessUrl: "https://example.com",
-          FailUrl: "https://example.com",
-        },
-      }),
-    });
-
-    const raw = await mfRes.text();
-    console.log("MyFatoorah response:", raw);
-
-    const data = JSON.parse(raw);
-
-    const paymentUrl = data?.Data?.PaymentURL;
-
-    res.json({ url: paymentUrl });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Payment error");
   }
 });
 
@@ -603,8 +407,6 @@ app.get("/api/recommend/:email", async (req, res) => {
   }
 });
 
-/* ================= SPELL CHECKER ================= */
-
 /* ================= CHECK ADMIN ================= */
 
 app.post("/api/check-admin", async (req, res) => {
@@ -754,12 +556,10 @@ async function sendToSheet(payload) {
 async function saveHistoryDirect(userEmail, orderId, itemList, date) {
   const username = userEmail.split("@")[0];
 
-  // 1️⃣ Save full email (very important for your history page)
   await historyDB.ref(`history/${username}`).update({
     fullEmail: userEmail,
   });
 
-  // 2️⃣ Save order
   await historyDB.ref(`history/${username}/${orderId}`).set({
     id: orderId,
     itemList,
@@ -1429,20 +1229,20 @@ app.post("/api/create-product", async (req, res) => {
     }
 
     // ================= VECTOR GENERATION =================
-    console.log("Generating vector...");
+    // console.log("Generating vector...");
 
-    const textForVector = `
-      ${name} 
-      ${category} 
-      ${description}
-    `;
+    // const textForVector = `
+    //   ${name} 
+    //   ${category} 
+    //   ${description}
+    // `;
 
-    const textVector = await getEmbedding(textForVector);
+    // const textVector = await getEmbedding(textForVector);
 
-    const vector = await getImageVector(mainImage);
+    // const vector = await getImageVector(mainImage);
 
-    console.log("Vector generated:", vector);
-    console.log("Vector length:", vector.length);
+    // console.log("Vector generated:", vector);
+    // console.log("Vector length:", vector.length);
 
     const productsRef = mainDB.ref("products");
     const newProductRef = productsRef.push();
@@ -1456,8 +1256,8 @@ app.post("/api/create-product", async (req, res) => {
       purity,
       description,
       mainImage,
-      vector,
-      textVector,
+      // vector,
+      // textVector,
       thumbnails: thumbnails || [],
       status: "in stock",
       createdAt: Date.now(),
