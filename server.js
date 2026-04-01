@@ -4,6 +4,35 @@ import multer from "multer";
 import cloudinary from "cloudinary";
 import admin from "firebase-admin";
 import dotenv from "dotenv";
+import fetch from "node-fetch";
+import { pipeline } from "@xenova/transformers";
+
+let extractor;
+
+async function loadModel() {
+  if (!extractor) {
+    console.log("Loading AI model...");
+    extractor = await pipeline(
+      "image-feature-extraction",
+      "Xenova/clip-vit-base-patch32",
+    );
+    console.log("Model loaded");
+  }
+}
+
+let textModel;
+
+async function loadTextModel() {
+  if (!textModel) {
+    console.log("Loading text model...");
+    textModel = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+    console.log("Text model loaded ✅");
+  }
+}
+
+loadTextModel();
+
+loadModel();
 
 dotenv.config();
 
@@ -94,7 +123,7 @@ function extractPublicId(url) {
   if (!url) return null;
 
   const match = url.match(
-    /\/upload\/(?:v\d+\/)?(.+)\.(jpg|jpeg|png|webp|avif)/i
+    /\/upload\/(?:v\d+\/)?(.+)\.(jpg|jpeg|png|webp|avif)/i,
   );
 
   return match ? match[1] : null;
@@ -104,17 +133,488 @@ app.get("/", (req, res) => {
   res.send("Server is running");
 });
 
+async function getImageVector(imageUrl) {
+  await loadModel();
+
+  const result = await extractor(imageUrl, {
+    pooling: "mean",
+    normalize: true,
+  });
+
+  return Array.from(Float32Array.from(result.data)).map((v) =>
+    Number(v.toFixed(4)),
+  );
+}
+
+async function getEmbedding(text) {
+  await loadTextModel();
+
+  const output = await textModel(text, {
+    pooling: "mean",
+    normalize: true,
+  });
+
+  return Array.from(Float32Array.from(output.data)).map((v) =>
+    Number(v.toFixed(4)),
+  );
+}
+
+function cosineSimilarity(a, b) {
+  let dot = 0,
+    magA = 0,
+    magB = 0;
+
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+
+  return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+}
+
+/* ================= SET GAME ================= */
+
+app.get("/api/user-top-pref/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const snap = await userDB
+      .ref(`user_pref/${userId}/id`)
+      .once("value");
+
+    const data = snap.val() || {};
+
+    const entries = Object.entries(data);
+
+    if (!entries.length) {
+      return res.status(404).json({ error: "No preferences found" });
+    }
+
+    entries.sort((a, b) => b[1] - a[1]);
+
+    const topFiveIds = entries.slice(0, 5).map(e => e[0]);
+
+    const randomId =
+      topFiveIds[Math.floor(Math.random() * topFiveIds.length)];
+
+    res.json({
+      topFive: topFiveIds,
+      selectedId: randomId,
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to get user preference" });
+  }
+});
+
+app.post("/api/ai-set", async (req, res) => {
+  try {
+    const { budget, baseProduct } = req.body;
+
+    if (!baseProduct) {
+      return res.status(400).json({ error: "Base product missing" });
+    }
+
+    const snap = await mainDB.ref("products").once("value");
+    const products = Object.values(snap.val() || {});
+
+    if (!products.length) {
+      return res.status(400).json({ error: "No products found" });
+    }
+
+    const getCategory = (name="") => {
+      name = name.toLowerCase();
+      if (name.includes("necklace")) return "necklace";
+      if (name.includes("bangle") || name.includes("bracelet")) return "bangle";
+      if (name.includes("earring")) return "earring";
+      if (name.includes("ring")) return "ring";
+      return "other";
+    };
+
+    const categories = ["necklace", "bangle", "earring", "ring", "other"];
+    const pools = {};
+
+    for (const cat of categories) {
+      pools[cat] = products
+        .filter(p =>
+          getCategory(p.category) === cat
+        )
+        .map(p => {
+          const t = cosineSimilarity(p.textVector, baseProduct.textVector);
+          const i = cosineSimilarity(p.vector, baseProduct.vector);
+          const score = (i * 0.85) + (t * 0.15);
+
+          return { product: p, score };
+        })
+        .sort((a, b) => b.score - a.score);
+    }
+
+    const finalSet = [];
+    let remaining = budget;
+
+    for (const cat of categories) {
+      for (const item of pools[cat]) {
+        if (item.product.price <= remaining) {
+          finalSet.push(item.product);
+          remaining -= item.product.price;
+          break;
+        }
+      }
+    }
+
+    res.json({
+      totalPrice: budget - remaining,
+      set: finalSet
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "AI set failed" });
+  }
+});
+
+/* ================= SEARCH HANDLER ================= */
+
+app.get("/api/semantic-search/:query", async (req, res) => {
+  try {
+    const { query } = req.params;
+
+    const queryVector = await getEmbedding(query);
+
+    const snapshot = await mainDB.ref("products").get();
+    const data = snapshot.val();
+
+    const products = Object.values(data || {});
+
+    const scored = products
+      .map((p) => {
+        if (!p.vector) return null;
+
+        const score = cosineSimilarity(queryVector, p.vector);
+
+        return { ...p, score };
+      })
+      .filter(Boolean);
+
+    scored.sort((a, b) => b.score - a.score);
+
+    res.json({
+      success: true,
+      results: scored.slice(0, 20),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false });
+  }
+});
+
+/* ================= VECTOR BACK-FILLER ================= */
+
+app.get("/api/backfill-vectors", async (req, res) => {
+  try {
+    const productsRef = mainDB.ref("products");
+    const snapshot = await productsRef.once("value");
+
+    const products = snapshot.val();
+    if (!products) return res.json({ success: false });
+
+    const updates = {};
+    let count = 0;
+
+    for (const key in products) {
+      const product = products[key];
+
+      // skip if already has vector
+      if (product.vector && product.vector.length) continue;
+      if (product.textVector && product.textVector.length) continue;
+
+      if (!product.mainImage) continue;
+      if (!product.name || !product.category || !product.description) continue;
+
+      console.log("Processing:", product.name);
+
+      try {
+        const textForVector = `
+          ${product.name} 
+          ${product.category} 
+          ${product.description}
+        `;
+
+        const textVector = await getEmbedding(textForVector);
+        const vector = await getImageVector(product.mainImage);
+
+        updates[`${key}/vector`] = vector;
+        updates[`${key}/textVector`] = textVector;
+        count++;
+      } catch (err) {
+        console.log("Failed for:", product.name);
+      }
+    }
+
+    await productsRef.update(updates);
+
+    res.json({
+      success: true,
+      updated: count,
+    });
+  } catch (err) {
+    console.error("Backfill error:", err);
+    res.status(500).json({ error: "Failed" });
+  }
+});
+
+/* ================= DELETE VECTOR ================= */
+
+app.get("/api/delete-vectors", async (req, res) => {
+  try {
+    const productsRef = mainDB.ref("products");
+    const snapshot = await productsRef.once("value");
+
+    const products = snapshot.val();
+    if (!products) return res.json({ success: false });
+
+    const updates = {};
+    let count = 0;
+
+    for (const key in products) {
+      const product = products[key];
+
+      if (product.vector) {
+        console.log("Removing vector from:", product.name);
+
+        updates[`${key}/vector`] = null;
+        count++;
+      }
+    }
+
+    await productsRef.update(updates);
+
+    res.json({
+      success: true,
+      removed: count,
+    });
+  } catch (err) {
+    console.error("Delete vectors error:", err);
+    res.status(500).json({ error: "Failed" });
+  }
+});
+
+app.post("/create-payment", async (req, res) => {
+  try {
+    const { amount, name, email, mobile } = req.body;
+
+    const mfRes = await fetch("https://apitest.myfatoorah.com/v3/payments", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer SK_KWT_vVZlnnAqu8jRByOWaRPNId4ShzEDNt256dvnjebuyzo52dXjAfRx2ixW5umjWSUx",
+      },
+      body: JSON.stringify({
+        PaymentMethod: "KNET",
+
+        Order: {
+          Amount: amount,
+          Currency: "KWD",
+          Reference: "FG-" + Date.now(),
+        },
+
+        Customer: {
+          Name: name,
+          Email: email,
+          Mobile: {
+            CountryCode: "+965",
+            Number: mobile
+          },
+        },
+
+        NotificationOption: "LINK",
+
+        IntegrationUrls: {
+          SuccessUrl: "https://example.com",
+          FailUrl: "https://example.com",
+        },
+      }),
+    });
+
+    const raw = await mfRes.text();
+    console.log("MyFatoorah response:", raw);
+
+    const data = JSON.parse(raw);
+
+    const paymentUrl = data?.Data?.PaymentURL;
+
+    res.json({ url: paymentUrl });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Payment error");
+  }
+});
+
+/* ================= VISUAL RECOMMENDER ================= */
+
+app.get("/api/recommend/:email", async (req, res) => {
+  try {
+    const email = req.params.email.split("@")[0].replaceAll(".", "_");
+
+    const prefSnap = await userDB.ref(`user_pref/${email}`).once("value");
+    const pref = prefSnap.val() || {};
+
+    // ===== TOP PREFERENCES =====
+    const favCategories = Object.entries(pref.category || {})
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 2)
+      .map((x) => x[0]);
+
+    const favPurities = Object.entries(pref.purity || {})
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 2)
+      .map((x) => x[0]);
+
+    const topIds = Object.entries(pref.id || {})
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map((x) => x[0]);
+
+    // ===== PRODUCTS =====
+    const productsSnap = await mainDB.ref("products").once("value");
+    const products = Object.values(productsSnap.val() || {});
+
+    if (!products.length) {
+      return res.json({ success: true, products: [] });
+    }
+
+    // ===== USER VECTORS =====
+    const userVectors = [];
+    const weights = [];
+
+    topIds.forEach((id) => {
+      const p = products.find((x) => x.id === id);
+      if (p && p.vector) {
+        console.log("Name:", p.name);
+        userVectors.push(p.vector);
+        weights.push(pref.id[id] || 1);
+      }
+    });
+
+    // ===== COSINE FUNCTION =====
+    function cosine(a, b) {
+      let dot = 0,
+        magA = 0,
+        magB = 0;
+
+      for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        magA += a[i] * a[i];
+        magB += b[i] * b[i];
+      }
+
+      if (magA === 0 || magB === 0) return 0;
+
+      return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+    }
+
+    // ===== SCORING =====
+    const scored = products
+      .filter((p) => p.status === "in stock")
+      .filter((p) => !topIds.includes(p.id))
+      .map((p) => {
+        // ✅ MULTI VECTOR MATCH (IMPORTANT FIX)
+        let vectorScore = 0;
+
+        if (p.vector && userVectors.length) {
+          let maxScore = 0;
+
+          userVectors.forEach((v, idx) => {
+            let sim = cosine(v, p.vector);
+
+            // normalize weight (VERY IMPORTANT)
+            let weightedSim = sim * (weights[idx] / Math.max(...weights));
+
+            if (weightedSim > maxScore) {
+              maxScore = weightedSim;
+            }
+          });
+
+          vectorScore = (maxScore + 1) / 2;
+        }
+
+        // ===== BOOSTS =====
+        const catBoost = favCategories.includes(p.category) ? 1 : 0;
+        const purBoost = favPurities.includes(p.purity) ? 1 : 0;
+
+        let newBoost = 0;
+        if (p.createdAt && Date.now() - p.createdAt < 7 * 86400000) {
+          newBoost = 1;
+        }
+
+        // ===== FINAL SCORE (BALANCED) =====
+        const finalScore =
+          vectorScore * 0.6 +
+          catBoost * 0.2 +
+          purBoost * 0.15 +
+          newBoost * 0.05;
+
+        return { ...p, score: finalScore };
+      });
+
+    const sorted = scored.sort((a, b) => b.score - a.score);
+
+    // ===== DIVERSITY (CATEGORY LIMIT) =====
+    const categoryCount = {};
+    const usedIds = new Set();
+    const final = [];
+
+    for (let p of sorted) {
+      if (usedIds.has(p.id)) continue;
+
+      const count = categoryCount[p.category] || 0;
+
+      if (count < 3) {
+        final.push(p);
+        usedIds.add(p.id);
+        categoryCount[p.category] = count + 1;
+      }
+
+      if (final.length === 10) break;
+    }
+
+    // ===== FALLBACK =====
+    if (final.length < 10) {
+      for (let p of products) {
+        if (usedIds.has(p.id)) continue;
+        if (p.status !== "in stock") continue;
+
+        final.push(p);
+        usedIds.add(p.id);
+
+        if (final.length === 10) break;
+      }
+    }
+
+    res.json({
+      success: true,
+      products: final,
+    });
+  } catch (err) {
+    console.error("Recommend error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ================= SPELL CHECKER ================= */
+
 /* ================= CHECK ADMIN ================= */
 
 app.post("/api/check-admin", async (req, res) => {
   try {
-
     const { userEmail } = req.body;
 
     if (!userEmail) {
       return res.status(400).json({
         success: false,
-        error: "Email required"
+        error: "Email required",
       });
     }
 
@@ -124,25 +624,30 @@ app.post("/api/check-admin", async (req, res) => {
 
     res.json({
       success: true,
-      isAdmin
+      isAdmin,
     });
-
   } catch (error) {
-
     console.error("ADMIN CHECK ERROR:", error);
 
     res.status(500).json({
       success: false,
-      error: "Failed to check admin"
+      error: "Failed to check admin",
     });
-
   }
 });
 
 /* ================= DELETE PRODUCT ================= */
 app.post("/api/delete-product", async (req, res) => {
   try {
-    const { productId } = req.body;
+    const { userEmail, productId } = req.body;
+
+    if (!userEmail) {
+      return res.status(403).json({ error: "No email provided" });
+    }
+
+    if (userEmail !== "adamhussain5353@gmail.com") {
+      return res.status(405).json({ error: "Not Admin" });
+    }
 
     if (!productId) {
       return res.status(400).json({ error: "Product ID required" });
@@ -217,18 +722,162 @@ app.post("/api/delete-hero", async (req, res) => {
     const data = snapshot.val();
     const currentImgs = Array.isArray(data.heroImg) ? data.heroImg : [];
 
-    const updatedImgs = currentImgs.filter(img => img !== imageUrl);
+    const updatedImgs = currentImgs.filter((img) => img !== imageUrl);
 
     await heroRef.set({
       heroImg: updatedImgs,
-      updatedAt: Date.now()
+      updatedAt: Date.now(),
     });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("HERO DELETE ERROR:", err);
+    res.status(500).json({ error: "Hero delete failed" });
+  }
+});
+
+// ================= SUBMIT CHECKOUT ORDER =================
+
+async function sendToSheet(payload) {
+  const sheetURL = "https://script.google.com/macros/s/AKfycbzdzj6fkPeUsaVrHG4VJx7VCWxIGUeI-KQOhGt-np8W_g8sg3Q-FdxLFsV5EYF9DUFb/exec";
+
+  const res = await fetch(sheetURL, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) throw new Error("Sheet failed");
+
+  return true;
+}
+
+async function saveHistoryDirect(userEmail, orderId, itemList, date) {
+  const username = userEmail.split("@")[0];
+
+  // 1️⃣ Save full email (very important for your history page)
+  await historyDB.ref(`history/${username}`).update({
+    fullEmail: userEmail,
+  });
+
+  // 2️⃣ Save order
+  await historyDB.ref(`history/${username}/${orderId}`).set({
+    id: orderId,
+    itemList,
+    date,
+  });
+}
+
+async function buildVerifiedProducts(cartItems) {
+  const verified = [];
+
+  for (const item of cartItems) {
+    const snap = await mainDB.ref(`products/${item.id}`).once("value");
+    const dbProduct = snap.val();
+
+    if (!dbProduct) {
+      throw new Error("Found Adulteration In Product");
+    }
+
+    const fieldsToCheck = ["name", "price", "weight", "purity", "category", "image"];
+
+    for (const field of fieldsToCheck) {
+      if (String(item[field]) !== String(dbProduct[field])) {
+        throw new Error(`Mismatch in ${field} for Product: ${item.name} ____ Real Value: ${String(dbProduct[field])} and Adulteration: ${String(item[field])}`);
+      }
+    }
+
+    if (isNaN(item.quantity) || item.quantity <= 0) {
+      throw new Error("Found Adulteration In Product");
+    }
+
+    verified.push({
+      id: item.id,
+      name: dbProduct.name,
+      price: dbProduct.price,
+      weight: dbProduct.weight,
+      purity: dbProduct.purity,
+      category: dbProduct.category,
+      img: dbProduct.img,
+      quantity: item.quantity
+    });
+  }
+
+  return verified;
+}
+
+app.post("/api/checkout-order", async (req, res) => {
+  try {
+    const { orderId, name, mobile, email, address, lat, lng, products, time } = req.body;
+
+    if (!products || !products.length) {
+      return res.status(400).json({ success: false });
+    }
+
+    const verifiedProducts = await buildVerifiedProducts(products);
+
+    await sendToSheet({
+      action: "checkout",
+      orderId,
+      name,
+      mobile,
+      email,
+      address,
+      lat,
+      lng,
+      products: verifiedProducts,
+      time
+    });
+
+    await saveHistoryDirect(email, orderId, products, time);
 
     res.json({ success: true });
 
   } catch (err) {
-    console.error("HERO DELETE ERROR:", err);
-    res.status(500).json({ error: "Hero delete failed" });
+    console.error("Checkout error:", err);
+
+    if (err.message === "Found Adulteration In Product") {
+      return res.status(400).json({
+        success: false,
+        message: "Found Adulteration In Product"
+      });
+    } else if (err.message.includes("Mismatch")) {
+      return res.status(403).json({
+        success: false,
+        message: err.message
+      });
+    }
+    res.status(500).json({ success: false });
+  }
+});
+
+app.post("/api/custom-order", async (req, res) => {
+  try {
+    const { orderId, name, mobile, email, address, lat, lng, description, karat, stone, weight, budget, customItem, time } = req.body;
+
+    await sendToSheet({
+      action: "custom",
+      orderId,
+      name,
+      mobile,
+      email,
+      address,
+      lat,
+      lng,
+      description,
+      karat,
+      stone,
+      weight,
+      budget,
+      time
+    });
+
+    await saveHistoryDirect(email, orderId, customItem, time);
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error("Custom error:", err);
+    res.status(500).json({ success: false });
   }
 });
 
@@ -236,12 +885,7 @@ app.post("/api/delete-hero", async (req, res) => {
 
 app.post("/api/update-product", async (req, res) => {
   try {
-
-    const {
-      userEmail,
-      productId,
-      updates
-    } = req.body;
+    const { userEmail, productId, updates } = req.body;
 
     if (!userEmail) {
       return res.status(403).json({ error: "No email provided" });
@@ -259,49 +903,43 @@ app.post("/api/update-product", async (req, res) => {
 
     await productRef.update({
       ...updates,
-      updatedAt: Date.now()
+      updatedAt: Date.now(),
     });
 
     res.json({ success: true });
-
   } catch (err) {
-
     console.error("UPDATE PRODUCT ERROR:", err);
 
     res.status(500).json({
-      error: "Failed to update product"
+      error: "Failed to update product",
     });
-
   }
 });
 
 /* ================= UPLOAD IMAGE ================= */
 app.post("/api/upload-image", upload.single("image"), async (req, res) => {
-
   if (!req.file) {
     return res.status(400).json({ error: "No file uploaded" });
   }
 
   const result = await new Promise((resolve, reject) => {
-    cloudinary.v2.uploader.upload_stream(
-      { folder: "fakhri-gold" },
-      (error, result) => {
+    cloudinary.v2.uploader
+      .upload_stream({ folder: "fakhri-gold" }, (error, result) => {
         if (error) reject(error);
         else resolve(result);
-      }
-    ).end(req.file.buffer);
+      })
+      .end(req.file.buffer);
   });
 
   res.json({
     success: true,
-    imageUrl: result.secure_url
+    imageUrl: result.secure_url,
   });
 });
 
 /* ================= UPDATE MONTH DATA ================= */
 app.post("/api/update-month", async (req, res) => {
   try {
-
     const { item } = req.body;
 
     if (!item || !Array.isArray(item)) {
@@ -311,7 +949,6 @@ app.post("/api/update-month", async (req, res) => {
     const monthRef = adminDB.ref("monthData");
 
     for (const product of item) {
-
       const { id, purity, category, quantity } = product;
 
       const qty = Number(quantity) || 0;
@@ -344,19 +981,15 @@ app.post("/api/update-month", async (req, res) => {
           return (current || 0) + qty;
         });
       }
-
     }
 
     res.json({ success: true });
-
   } catch (err) {
-
     console.error("SAVE ERROR:", err);
 
     res.status(500).json({
-      error: "Failed to update month data"
+      error: "Failed to update month data",
     });
-
   }
 });
 
@@ -364,7 +997,6 @@ app.post("/api/update-month", async (req, res) => {
 
 app.get("/api/product-dates/:productId", async (req, res) => {
   try {
-
     const { productId } = req.params;
 
     if (!productId) {
@@ -377,7 +1009,7 @@ app.get("/api/product-dates/:productId", async (req, res) => {
       return res.json({
         success: true,
         createdAt: null,
-        updatedAt: null
+        updatedAt: null,
       });
     }
 
@@ -386,25 +1018,21 @@ app.get("/api/product-dates/:productId", async (req, res) => {
     res.json({
       success: true,
       createdAt: data.createdAt || null,
-      updatedAt: data.updatedAt || null
+      updatedAt: data.updatedAt || null,
     });
-
   } catch (error) {
-
     console.error("PRODUCT DATE ERROR:", error);
 
     res.status(500).json({
       success: false,
-      error: "Failed to fetch product dates"
+      error: "Failed to fetch product dates",
     });
-
   }
 });
 
 /* ================= GET MONTH ANALYSIS ================= */
 app.get("/api/get-month-analysis", async (req, res) => {
   try {
-
     const snap = await adminDB.ref("monthData").get();
 
     if (!snap.exists()) {
@@ -412,7 +1040,7 @@ app.get("/api/get-month-analysis", async (req, res) => {
         success: true,
         bestPurity: null,
         bestCategory: null,
-        topProducts: []
+        topProducts: [],
       });
     }
 
@@ -423,35 +1051,32 @@ app.get("/api/get-month-analysis", async (req, res) => {
     const category = data.category || {};
 
     // ===== BEST PRODUCTS =====
-    const bestProduct = Object.entries(products)
-      .sort((a,b) => b[1] - a[1])[0]?.[0] || null;
+    const bestProduct =
+      Object.entries(products).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
 
     // ===== BEST PURITY =====
     const bestPurity = Object.entries(purity).length
-      ? Object.entries(purity).sort((a,b)=>b[1]-a[1])[0][0]
+      ? Object.entries(purity).sort((a, b) => b[1] - a[1])[0][0]
       : null;
 
     // ===== BEST CATEGORY =====
     const bestCategory = Object.entries(category).length
-      ? Object.entries(category).sort((a,b)=>b[1]-a[1])[0][0]
+      ? Object.entries(category).sort((a, b) => b[1] - a[1])[0][0]
       : null;
 
     res.json({
       success: true,
       bestPurity,
       bestCategory,
-      bestProduct
+      bestProduct,
     });
-
   } catch (err) {
-
     console.error("MONTH ANALYSIS ERROR:", err);
 
     res.status(500).json({
       success: false,
-      error: "Failed to analyze month data"
+      error: "Failed to analyze month data",
     });
-
   }
 });
 
@@ -477,11 +1102,10 @@ app.post("/api/save-history", async (req, res) => {
     await historyRef.set({
       id,
       itemList,
-      date
+      date,
     });
 
     res.json({ success: true });
-
   } catch (err) {
     console.error("SAVE ERROR:", err);
     res.status(500).json({ error: "Failed to save" });
@@ -508,7 +1132,6 @@ app.post("/api/get-history", async (req, res) => {
     const data = snapshot.val();
 
     res.json({ orders: data });
-
   } catch (err) {
     console.error("GET HISTORY ERROR:", err);
     res.status(500).json({ error: "Failed to fetch history" });
@@ -524,14 +1147,15 @@ app.post("/api/mark-complete", async (req, res) => {
       return res.status(400).json({ error: "Missing data" });
     }
 
-    const historyRef = historyDB.ref(`history/${userEmail}/${orderId}/itemList/${itemIndex}`);
+    const historyRef = historyDB.ref(
+      `history/${userEmail}/${orderId}/itemList/${itemIndex}`,
+    );
 
     await historyRef.update({
-      complete: Boolean(status)
+      complete: Boolean(status),
     });
 
     res.json({ success: true });
-
   } catch (err) {
     console.error("SAVE ERROR:", err);
     res.status(500).json({ error: "Failed to save" });
@@ -547,14 +1171,15 @@ app.post("/api/set-arrival", async (req, res) => {
       return res.status(400).json({ error: "Missing data" });
     }
 
-    const historyRef = historyDB.ref(`history/${userEmail}/${orderId}/itemList/${itemIndex}`);
+    const historyRef = historyDB.ref(
+      `history/${userEmail}/${orderId}/itemList/${itemIndex}`,
+    );
 
     await historyRef.update({
-      arrival: arrival
+      arrival: arrival,
     });
 
     res.json({ success: true });
-
   } catch (err) {
     console.error("SAVE ERROR:", err);
     res.status(500).json({ error: "Failed to save" });
@@ -594,7 +1219,6 @@ app.post("/api/cancel-order", async (req, res) => {
     }
 
     res.json({ success: true });
-
   } catch (error) {
     console.error("Cancel error:", error);
     res.status(500).json({ error: "Server error" });
@@ -618,8 +1242,8 @@ app.post("/api/admin-order", async (req, res) => {
     const snapshot = await historyDB.ref("history").once("value");
     const emailData = {
       serviceId: "service_ffwaewp",
-      templateId: "template_4frx3mr"
-    }
+      templateId: "template_4frx3mr",
+    };
 
     if (!snapshot.exists()) {
       return res.json({ success: true, history: {} });
@@ -628,9 +1252,8 @@ app.post("/api/admin-order", async (req, res) => {
     res.json({
       success: true,
       history: snapshot.val(),
-      emailData: emailData
+      emailData: emailData,
     });
-
   } catch (error) {
     console.error("Fetch error:", error);
     res.status(500).json({ error: "Server error" });
@@ -640,11 +1263,10 @@ app.post("/api/admin-order", async (req, res) => {
 /* ================= GET GOLD RATE ================= */
 
 app.get("/api/gold-rate", async (req, res) => {
-
   try {
-
     const gold_url = "https://api.gold-api.com/price/XAU";
-    const curr_url = "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json";
+    const curr_url =
+      "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json";
 
     const goldRes = await fetch(gold_url);
     const goldData = await goldRes.json();
@@ -662,20 +1284,16 @@ app.get("/api/gold-rate", async (req, res) => {
       success: true,
       priceGram: pricePerGramKWD,
       priceOunce: goldData.price,
-      exchange_rate: exchange
+      exchange_rate: exchange,
     });
-
   } catch (error) {
-
     console.error("Gold rate error:", error);
 
     res.status(500).json({
       success: false,
-      message: "Failed to fetch gold rate"
+      message: "Failed to fetch gold rate",
     });
-
   }
-
 });
 
 /* ================= TRANSLATE API ================= */
@@ -696,7 +1314,7 @@ app.post("/api/translate", async (req, res) => {
     if (cache[id]?.[field]?.ar) {
       return res.json({
         success: true,
-        ar: cache[id][field].ar
+        ar: cache[id][field].ar,
       });
     }
 
@@ -712,16 +1330,15 @@ app.post("/api/translate", async (req, res) => {
     if (!cache[id]) cache[id] = {};
     cache[id][field] = {
       en: text,
-      ar: arabicText
+      ar: arabicText,
     };
 
     await cacheRef.set(cache);
 
     res.json({
       success: true,
-      ar: arabicText
+      ar: arabicText,
     });
-
   } catch (error) {
     console.error("TRANSLATION ERROR:", error);
     res.status(500).json({ error: "Translation failed" });
@@ -732,7 +1349,6 @@ app.post("/api/translate", async (req, res) => {
 
 app.get("/api/products", async (req, res) => {
   try {
-
     const snapshot = await mainDB.ref("products").get();
 
     if (!snapshot.exists()) {
@@ -743,14 +1359,13 @@ app.get("/api/products", async (req, res) => {
 
     const products = Object.entries(data).map(([id, product]) => ({
       id,
-      ...product
+      ...product,
     }));
 
     res.json({
       success: true,
-      products
+      products,
     });
-
   } catch (error) {
     console.error("Products error:", error);
     res.status(500).json({ error: "Failed to fetch products" });
@@ -761,7 +1376,6 @@ app.get("/api/products", async (req, res) => {
 
 app.get("/api/hero", async (req, res) => {
   try {
-
     const snapshot = await adminDB.ref("Hero").once("value");
 
     if (!snapshot.exists()) {
@@ -770,9 +1384,8 @@ app.get("/api/hero", async (req, res) => {
 
     res.json({
       success: true,
-      heroImg: snapshot.val().heroImg || []
+      heroImg: snapshot.val().heroImg || [],
     });
-
   } catch (error) {
     console.error("Hero fetch error:", error);
     res.status(500).json({ error: "Failed to fetch hero images" });
@@ -792,7 +1405,7 @@ app.post("/api/create-product", async (req, res) => {
       purity,
       description,
       mainImage,
-      thumbnails
+      thumbnails,
     } = req.body;
 
     if (!userEmail) {
@@ -803,9 +1416,33 @@ app.post("/api/create-product", async (req, res) => {
       return res.status(405).json({ error: "Not Admin" });
     }
 
-    if (!name || !price || !weight || !category || !purity || !description || !mainImage) {
+    if (
+      !name ||
+      !price ||
+      !weight ||
+      !category ||
+      !purity ||
+      !description ||
+      !mainImage
+    ) {
       return res.status(400).json({ error: "Missing fields" });
     }
+
+    // ================= VECTOR GENERATION =================
+    console.log("Generating vector...");
+
+    const textForVector = `
+      ${name} 
+      ${category} 
+      ${description}
+    `;
+
+    const textVector = await getEmbedding(textForVector);
+
+    const vector = await getImageVector(mainImage);
+
+    console.log("Vector generated:", vector);
+    console.log("Vector length:", vector.length);
 
     const productsRef = mainDB.ref("products");
     const newProductRef = productsRef.push();
@@ -819,13 +1456,14 @@ app.post("/api/create-product", async (req, res) => {
       purity,
       description,
       mainImage,
+      vector,
+      textVector,
       thumbnails: thumbnails || [],
       status: "in stock",
-      createdAt: Date.now()
+      createdAt: Date.now(),
     });
 
     res.json({ success: true });
-
   } catch (err) {
     console.error("Create product error:", err);
     res.status(500).json({ error: "Server error" });
@@ -851,11 +1489,10 @@ app.post("/api/set-gold-price", async (req, res) => {
     }
 
     await adminDB.ref(`gold/${goldCategory}`).set({
-      price: goldPrice
+      price: goldPrice,
     });
 
     res.json({ success: true });
-
   } catch (err) {
     console.error("Gold price error:", err);
     res.status(500).json({ error: "Server error" });
@@ -882,11 +1519,10 @@ app.post("/api/save-hero", async (req, res) => {
 
     await adminDB.ref("Hero").set({
       heroImg,
-      updatedAt: Date.now()
+      updatedAt: Date.now(),
     });
 
     res.json({ success: true });
-
   } catch (err) {
     console.error("Hero save error:", err);
     res.status(500).json({ error: "Server error" });
@@ -897,26 +1533,23 @@ app.post("/api/save-hero", async (req, res) => {
 
 app.post("/api/upload-image", upload.single("image"), async (req, res) => {
   try {
-
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded" });
     }
 
     const result = await new Promise((resolve, reject) => {
-      cloudinary.v2.uploader.upload_stream(
-        { folder: "fakhri-gold" },
-        (error, result) => {
+      cloudinary.v2.uploader
+        .upload_stream({ folder: "fakhri-gold" }, (error, result) => {
           if (error) reject(error);
           else resolve(result);
-        }
-      ).end(req.file.buffer);
+        })
+        .end(req.file.buffer);
     });
 
     res.json({
       success: true,
-      imageUrl: result.secure_url
+      imageUrl: result.secure_url,
     });
-
   } catch (error) {
     console.error("Upload error:", error);
     res.status(500).json({ error: "Upload failed" });
@@ -929,10 +1562,7 @@ app.post("/api/update-profile-data", async (req, res) => {
   try {
     const { orderQty, goldPrice } = req.body;
 
-    if (
-      typeof orderQty !== "number" ||
-      typeof goldPrice !== "number"
-    ) {
+    if (typeof orderQty !== "number" || typeof goldPrice !== "number") {
       return res.status(400).json({
         error: "orderQty and goldPrice must be numbers",
       });
@@ -959,7 +1589,6 @@ app.post("/api/update-profile-data", async (req, res) => {
       orderQty: updatedQty,
       goldPrice: updatedGold,
     });
-
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Server error" });
@@ -978,7 +1607,7 @@ app.get("/api/get-market-hype", async (req, res) => {
         success: true,
         totalQty: 0,
         hypeScore: 0,
-        hypeLevel: "No Activity"
+        hypeLevel: "No Activity",
       });
     }
 
@@ -986,13 +1615,12 @@ app.get("/api/get-market-hype", async (req, res) => {
 
     let totalQty = 0;
 
-    Object.values(data).forEach(section => {
+    Object.values(data).forEach((section) => {
       if (typeof section === "object") {
-        Object.values(section).forEach(value => {
+        Object.values(section).forEach((value) => {
           totalQty += Number(value) || 0;
         });
       }
-
     });
 
     let hypeScore = Math.min((totalQty / 300) * 100, 100);
@@ -1014,12 +1642,11 @@ app.get("/api/get-market-hype", async (req, res) => {
       hypeScore,
       hypeLevel,
     });
-
   } catch (error) {
     console.error("Market Hype error:", error);
     res.status(500).json({
       success: false,
-      error: "Failed to calculate market hype"
+      error: "Failed to calculate market hype",
     });
   }
 });
@@ -1043,7 +1670,7 @@ app.post("/api/get-profile-dashboard", async (req, res) => {
         totalQty: 0,
         totalSpent: 0,
         totalGold: 0,
-        lastOrder: "-"
+        lastOrder: "-",
       });
     }
 
@@ -1056,18 +1683,16 @@ app.post("/api/get-profile-dashboard", async (req, res) => {
 
     const orders = Object.values(data);
 
-    orders.forEach(order => {
-
+    orders.forEach((order) => {
       if (!order.itemList) return;
 
       lastOrder = order.date || "-";
 
-      order.itemList.forEach(item => {
+      order.itemList.forEach((item) => {
         totalQty += Number(item.quantity) || 0;
         totalSpent += Number(item.price) || 0;
         totalGold += Number(item.weight) || 0;
       });
-
     });
 
     res.json({
@@ -1075,14 +1700,13 @@ app.post("/api/get-profile-dashboard", async (req, res) => {
       totalQty,
       totalSpent,
       totalGold,
-      lastOrder
+      lastOrder,
     });
-
   } catch (error) {
     console.error("PROFILE DASHBOARD ERROR:", error);
     res.status(500).json({
       success: false,
-      error: "Failed to calculate profile data"
+      error: "Failed to calculate profile data",
     });
   }
 });
@@ -1104,13 +1728,15 @@ app.post("/api/add-pref", async (req, res) => {
     const updates = {};
 
     if (id) updates[`id/${id}`] = admin.database.ServerValue.increment(score);
-    if (purity) updates[`purity/${purity}`] = admin.database.ServerValue.increment(score);
-    if (category) updates[`category/${category}`] = admin.database.ServerValue.increment(score);
+    if (purity)
+      updates[`purity/${purity}`] = admin.database.ServerValue.increment(score);
+    if (category)
+      updates[`category/${category}`] =
+        admin.database.ServerValue.increment(score);
 
     await userRef.update(updates);
 
     res.json({ success: true });
-
   } catch (err) {
     console.error("Preference error:", err);
     res.status(500).json({ success: false });
@@ -1121,13 +1747,12 @@ app.post("/api/add-pref", async (req, res) => {
 
 app.get("/api/user-pref/:email", async (req, res) => {
   try {
-
     let { email } = req.params;
 
     if (!email) {
       return res.status(400).json({
         success: false,
-        error: "Email required"
+        error: "Email required",
       });
     }
 
@@ -1141,33 +1766,28 @@ app.get("/api/user-pref/:email", async (req, res) => {
     if (!snap.exists()) {
       return res.json({
         success: true,
-        data: null
+        data: null,
       });
     }
 
     res.json({
       success: true,
-      data: snap.val()
+      data: snap.val(),
     });
-
   } catch (error) {
-
     console.error("User pref error:", error);
 
     res.status(500).json({
       success: false,
-      error: "Failed to get user preferences"
+      error: "Failed to get user preferences",
     });
-
   }
 });
 
 /* ================= TOP TRENDING PRODUCTS ================= */
 
 app.get("/api/top-products", async (req, res) => {
-
   try {
-
     const ref = adminDB.ref("monthData/products");
 
     const snap = await ref.get();
@@ -1175,7 +1795,7 @@ app.get("/api/top-products", async (req, res) => {
     if (!snap.exists()) {
       return res.json({
         success: true,
-        topProducts: []
+        topProducts: [],
       });
     }
 
@@ -1183,25 +1803,21 @@ app.get("/api/top-products", async (req, res) => {
 
     const topProducts = Object.entries(data)
       .sort((a, b) => b[1] - a[1]) // sort by clicks
-      .slice(0, 5)                 // top 5
-      .map(x => x[0]);             // return only ids
+      .slice(0, 5) // top 5
+      .map((x) => x[0]); // return only ids
 
     res.json({
       success: true,
-      topProducts
+      topProducts,
     });
-
   } catch (error) {
-
     console.error("Top products error:", error);
 
     res.status(500).json({
       success: false,
-      error: "Failed to get top products"
+      error: "Failed to get top products",
     });
-
   }
-
 });
 
 /* ================= SERVER ================= */
